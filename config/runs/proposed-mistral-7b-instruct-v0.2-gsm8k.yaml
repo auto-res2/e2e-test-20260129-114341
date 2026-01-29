@@ -1,0 +1,58 @@
+run_id: proposed-mistral-7b-instruct-v0.2-gsm8k
+method: FAct-A²-CoT-Decoding
+model:
+  name: mistralai/Mistral-7B-Instruct-v0.2
+  dtype: float16
+  device_map: auto
+dataset:
+  name: gsm8k
+  split: test
+  preprocessing:
+    max_length: 1024
+    answer_extraction: last-number-or-boxed
+training:
+  task: inference_only
+  epochs: 0
+  batch_size: 1
+  learning_rate: 0.0
+  optimizer: none
+  warmup_steps: 0
+decoding:
+  k: 10
+  m: 3
+  max_new_tokens: 256
+  rerank_score:
+    alpha: 1.2
+    beta: 0.7
+    gamma: 0.5
+    eps: 1.0e-4
+    triage_penalty: 5.0
+  audit:
+    dual_extraction: true
+    cite_required: true
+    agreement_on: last_val
+optuna:
+  n_trials: 20
+  search_spaces:
+    - param_name: m
+      distribution_type: categorical
+      choices: [1, 2, 3, 4, 5]
+    - param_name: alpha
+      distribution_type: uniform
+      low: 0.2
+      high: 3.0
+    - param_name: beta
+      distribution_type: uniform
+      low: 0.0
+      high: 2.0
+    - param_name: gamma
+      distribution_type: uniform
+      low: 0.0
+      high: 2.0
+    - param_name: triage_penalty
+      distribution_type: uniform
+      low: 1.0
+      high: 10.0
+    - param_name: max_new_tokens
+      distribution_type: categorical
+      choices: [256, 320, 384]

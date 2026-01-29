@@ -1,0 +1,25 @@
+run_id: comparative-1-mistral-7b-instruct-v0.2-gsm8k
+method: CoT-decoding + Δ_answer reranking (baseline)
+model:
+  name: mistralai/Mistral-7B-Instruct-v0.2
+  dtype: float16
+  device_map: auto
+dataset:
+  name: gsm8k
+  split: test
+  preprocessing:
+    max_length: 1024
+    answer_extraction: last-number-or-boxed
+training:
+  task: inference_only
+  epochs: 0
+  batch_size: 1
+  learning_rate: 0.0
+  optimizer: none
+  warmup_steps: 0
+decoding:
+  k: 10
+  max_new_tokens: 256
+  rerank_score:
+    delta_answer_only: true
+    triage: false

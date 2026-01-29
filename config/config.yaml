@@ -1,0 +1,33 @@
+defaults:
+  - runs@run: ???
+  - _self_
+
+mode: full
+results_dir: outputs
+seed: 42
+cache_dir: .cache/
+
+wandb:
+  entity: airas
+  project: 2026-01-29
+  mode: online
+
+optuna:
+  validation_size: 100
+  direction: maximize
+  n_trials: 0
+  study_name: null
+
+training:
+  max_questions: null
+  max_batches: null
+  epochs: 1
+  log_every: 1
+  log_grad_norm: false
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  job:
+    chdir: false

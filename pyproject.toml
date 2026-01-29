@@ -1,1 +1,25 @@
-# Please list the required python packages.
+[project]
+name = "fact-a2-cot-decoding"
+version = "0.1.0"
+description = "FAct-A²-CoT-Decoding experiments with Hydra"
+requires-python = ">=3.10"
+
+dependencies = [
+    "torch",
+    "transformers",
+    "datasets",
+    "accelerate",
+    "hydra-core",
+    "wandb",
+    "optuna",
+    "numpy",
+    "pandas",
+    "matplotlib",
+    "seaborn",
+    "scikit-learn",
+    "tqdm",
+    "sentencepiece",
+]
+
+[tool.uv]
+package = true

@@ -809,5 +809,107 @@
     "experimental_code": "import ast, json, math, re, torch\nfrom transformers import AutoModelForCausalLM, AutoTokenizer\n\n# ---------- basic helpers ----------\n\ndef last_number(text: str):\n    nums = re.findall(r\"-?\\d+\\.?\\d*\", text)\n    return nums[-1] if nums else \"\"\n\n@torch.inference_mode()\ndef next_token_logprobs(model, input_ids):\n    out = model(input_ids=input_ids)\n    return torch.log_softmax(out.logits[:, -1, :], dim=-1).squeeze(0)\n\n@torch.inference_mode()\ndef cot_decode_candidates(model, tok, prompt, k=10, max_new_tokens=256):\n    ids = tok(prompt, return_tensors=\"pt\").input_ids.to(model.device)\n    lp = next_token_logprobs(model, ids)\n    topk = torch.topk(lp, k)\n    cand_texts = []\n    for tid in topk.indices.tolist():\n        first = torch.tensor([[tid]], device=model.device)\n        out = model.generate(torch.cat([ids, first], dim=1), max_new_tokens=max_new_tokens, do_sample=False)\n        cand_texts.append(tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True))\n    return cand_texts\n\n@torch.inference_mode()\ndef answer_margin_delta(model, tok, prompt, completion):\n    ans = last_number(completion)\n    if not ans:\n        return -1e9\n    full = prompt + completion\n    ids = tok(full, return_tensors=\"pt\").input_ids.to(model.device)\n    out = model(ids)\n    lps = torch.log_softmax(out.logits[:, :-1, :], dim=-1)\n    ans_ids = tok(ans, add_special_tokens=False).input_ids\n    if len(ans_ids) == 0 or ids.shape[1] < len(ans_ids) + 1:\n        return -1e9\n    margins = []\n    for i in range(len(ans_ids)):\n        pos = -len(ans_ids) + i - 1\n        lp_pos = lps[0, pos]\n        top2 = torch.topk(lp_pos, 2).values\n        margins.append((top2[0] - top2[1]).item())\n    return sum(margins) / len(margins)\n\n# ---------- safe arithmetic eval ----------\n\n_ALLOWED_BINOPS = (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow)\n_ALLOWED_UNARYOPS = (ast.UAdd, ast.USub)\n\nclass UnsafeExpr(Exception):\n    pass\n\ndef _check_ast(node: ast.AST):\n    if isinstance(node, ast.Expression):\n        _check_ast(node.body)\n    elif isinstance(node, ast.BinOp):\n        if not isinstance(node.op, _ALLOWED_BINOPS):\n            raise UnsafeExpr\n        _check_ast(node.left); _check_ast(node.right)\n    elif isinstance(node, ast.UnaryOp):\n        if not isinstance(node.op, _ALLOWED_UNARYOPS):\n            raise UnsafeExpr\n        _check_ast(node.operand)\n    elif isinstance(node, (ast.Constant, ast.Num)):\n        val = node.n if hasattr(node, \"n\") else node.value\n        if not isinstance(val, (int, float)):\n            raise UnsafeExpr\n    else:\n        raise UnsafeExpr\n\n\ndef safe_eval_arith(expr: str) -> float:\n    expr = expr.strip()\n    if not re.fullmatch(r\"[0-9\\s\\+\\-\\*/\\(\\)\\.\\*]+\", expr):\n        raise UnsafeExpr\n    tree = ast.parse(expr, mode=\"eval\")\n    _check_ast(tree)\n    return float(eval(compile(tree, \"<expr>\", \"eval\"), {\"__builtins__\": {}}, {}))\n\n# ---------- faithful audit extraction + scoring ----------\n\ndef parse_first_json_array(text: str):\n    m = re.search(r\"\\[\\s*\\{.*?\\}\\s*\\]\", text, flags=re.DOTALL)\n    if not m:\n        return None\n    try:\n        return json.loads(m.group(0))\n    except Exception:\n        return None\n\n@torch.inference_mode()\ndef extract_trace(model, tok, question: str, candidate: str, variant: int = 0, max_new_tokens=256):\n    # Two slightly different instructions to reduce prompt-artifact dependence\n    header = (\n        \"Extract arithmetic steps from the candidate as JSON only.\\n\"\n        \"Output JSON array of objects with keys: expr (string), val (number), cite (verbatim substring from candidate).\\n\"\n        \"Constraints: expr uses only digits,+,-,*,/,(), optional **. cite must appear EXACTLY in the candidate.\\n\"\n        \"No extra text.\\n\"\n    )\n    if variant == 1:\n        header = (\n            \"Return ONLY a JSON array. Each element: {\\\"cite\\\":...,\\\"expr\\\":...,\\\"val\\\":...}.\\n\"\n            \"cite must be copied exactly from the candidate solution text.\\n\"\n            \"expr must be pure arithmetic with digits and + - * / ( ) and optional **.\\n\"\n            \"No commentary.\\n\"\n        )\n    aprompt = f\"{header}\\nQuestion: {question}\\nCandidate: {candidate}\\nJSON:\\n\"\n    ids = tok(aprompt, return_tensors=\"pt\").input_ids.to(model.device)\n    out = model.generate(ids, max_new_tokens=max_new_tokens, do_sample=False)\n    gen = tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True)\n    return parse_first_json_array(gen)\n\n\ndef cite_tokens_ok(expr: str, cite: str) -> bool:\n    # simple containment: all number/operator tokens from expr should appear in cite\n    expr_toks = re.findall(r\"\\d+\\.?\\d*|\\*\\*|[\\+\\-\\*/\\(\\)]\", expr)\n    cite_flat = cite.replace(\" \", \"\")\n    for t in expr_toks:\n        if t not in cite_flat:\n            return False\n    return True\n\n\ndef audit_trace(trace, candidate_text: str, final_answer_str: str, tol=1e-6):\n    if not isinstance(trace, list) or len(trace) == 0:\n        return dict(arith_pass_rate=0.0, cite_rate=0.0, faithful_pass_rate=0.0, final_consistent=0, last_val=None)\n\n    arith_pass = 0\n    cite_pass = 0\n    last_val = None\n    n = 0\n\n    for step in trace:\n        if not isinstance(step, dict):\n            continue\n        if \"expr\" not in step or \"val\" not in step or \"cite\" not in step:\n            continue\n        n += 1\n        expr = str(step[\"expr\"]).strip()\n        cite = str(step[\"cite\"])\n        # citation validity\n        cite_ok = (cite in candidate_text) and cite_tokens_ok(expr, cite)\n        if cite_ok:\n            cite_pass += 1\n        # arithmetic validity\n        try:\n            claimed = float(step[\"val\"])\n            computed = safe_eval_arith(expr)\n            arith_ok = math.isfinite(computed) and abs(computed - claimed) <= tol * max(1.0, abs(claimed))\n        except Exception:\n            arith_ok = False\n        if arith_ok:\n            arith_pass += 1\n            if cite_ok:\n                last_val = claimed  # only trust last value when both pass\n\n    if n == 0:\n        return dict(arith_pass_rate=0.0, cite_rate=0.0, faithful_pass_rate=0.0, final_consistent=0, last_val=None)\n\n    ar = arith_pass / n\n    cr = cite_pass / n\n    fr = ar * cr\n\n    final_consistent = 0\n    if final_answer_str and last_val is not None:\n        try:\n            final_consistent = int(abs(float(final_answer_str) - float(last_val)) <= tol * max(1.0, abs(last_val)))\n        except Exception:\n            final_consistent = 0\n\n    return dict(arith_pass_rate=ar, cite_rate=cr, faithful_pass_rate=fr, final_consistent=final_consistent, last_val=last_val)\n\n\ndef agreement_score(audit_a: dict, audit_b: dict, eps=1e-4) -> float:\n    # lightweight: agreement on last audited value if present; else 0\n    va, vb = audit_a.get(\"last_val\"), audit_b.get(\"last_val\")\n    if va is None or vb is None:\n        return eps\n    return 1.0 if abs(float(va) - float(vb)) <= 1e-6 * max(1.0, abs(float(va))) else eps\n\n# ---------- FAct-A^2-CoT decoding ----------\n\n@torch.inference_mode()\ndef fact_a2_cot_decode(model, tok, question: str, k=10, m=3, alpha=1.2, beta=0.7, gamma=0.5, eps=1e-4, max_new_tokens=256):\n    prompt = f\"Q: {question}\\nA:\"\n    cands = cot_decode_candidates(model, tok, prompt, k=k, max_new_tokens=max_new_tokens)\n\n    deltas = [answer_margin_delta(model, tok, prompt, c) for c in cands]\n    top_idx = sorted(range(len(cands)), key=lambda i: deltas[i], reverse=True)[:m]\n\n    best_i, best_score = None, -1e18\n    for i, c in enumerate(cands):\n        d = deltas[i]\n        if i not in top_idx:\n            score = d - 5.0  # triage penalty: only top-m get audited\n        else:\n            ans_str = last_number(c)\n            t1 = extract_trace(model, tok, question, c, variant=0)\n            t2 = extract_trace(model, tok, question, c, variant=1)\n            a1 = audit_trace(t1, c, ans_str)\n            a2 = audit_trace(t2, c, ans_str)\n            fr = max(a1[\"faithful_pass_rate\"], a2[\"faithful_pass_rate\"])  # be robust to minor formatting variance\n            fc = max(a1[\"final_consistent\"], a2[\"final_consistent\"])\n            ag = agreement_score(a1, a2, eps=eps)\n            score = d + alpha * math.log(fr + eps) + beta * fc + gamma * math.log(ag + eps)\n\n        if score > best_score:\n            best_score, best_i = score, i\n\n    return cands[best_i]\n\n# Example:\n# model_name = \"mistralai/Mistral-7B-Instruct-v0.2\"\n# tok = AutoTokenizer.from_pretrained(model_name)\n# model = AutoModelForCausalLM.from_pretrained(model_name, device_map=\"auto\", torch_dtype=torch.float16)\n# print(fact_a2_cot_decode(model, tok, \"If you have 3 apples and buy 4 more, how many apples?\"))\n",
     "expected_result": "On GSM8K (test) with `mistralai/Mistral-7B-Instruct-v0.2`, k=10 candidates shared across rerankers:\n- Greedy: ~45–50% accuracy.\n- CoT-decoding (Δ only): ~52–56%.\n- PASS/FAIL self-verification reranking: ~55–59%.\n- A² (single extraction, no faithfulness): ~58–63%.\n- **FAct-A² (faithful audit + dual extraction + triage m=3): ~60–65%** (expected +1 to +3 over A², +4 to +8 over Δ-only).\n\nSecondary predictions:\n- JSON parse rate (at least one of two extractions parseable): ~85–95% (higher than single strict prompt due to redundancy).\n- Median cite_rate among parseable traces: ~0.7–0.9; and a measurable tail of low cite_rate cases that correspond to “audit rationalization” attempts.\n- Among Δ-only errors, FAct-A² corrects a larger share than A² specifically in cases where A² would have accepted a post-hoc ‘clean’ trace: expected additional flip-to-correct of ~2–5% of Δ-only error cases.\n- Compute: only 2m extra generations/question (m=3 ⇒ 6) rather than 2k (k=10 ⇒ 20), making wall-clock cost comparable to (or lower than) auditing all candidates.\n\nHigher is better for accuracy.",
     "expected_conclusion": "Adding deterministic checking is helpful, but *unfaithful* verification can still certify wrong answers when the model rewrites its work during the audit. FAct-A²-CoT-Decoding makes the decode-time selector both **mechanistically grounded** (Python-evaluated arithmetic) and **faithfulness-constrained** (verbatim citation alignment), plus more robust via dual-extraction agreement and more deployable via triage.\n\nAcademic value: it isolates an under-studied but practically critical failure mode—**post-hoc rationalization during verification**—and provides a clean, training-free inference-time algorithm to measure and reduce it, extending CoT-decoding’s reranking criterion from answer confidence to *faithfully verifiable process correctness*. \n\nSocial value: it reduces the risk of ‘audited-sounding’ yet incorrect solutions in tutoring, budgeting, and decision support by requiring that the audit corresponds to what the model actually wrote, aligning more closely with human checking behavior (verify your written steps, don’t replace them)."
+  },
+  "experimental_design": {
+    "experiment_summary": "Task: solve grade-school math word problems by generating chain-of-thought (CoT) style solutions and selecting a single final numeric answer per question.\n\nPurpose: demonstrate that FAct-A²-CoT-Decoding (Faithful Audited & Triage-augmented CoT Decoding) improves decode-time candidate selection by using a deterministically checkable arithmetic audit that is *faithfully anchored* to the candidate’s own written steps, reducing “confident-but-wrong” and post-hoc rationalization failures common to CoT-decoding-style rerankers.\n\nOverall workflow (per question):\n1) Candidate generation (shared across all methods): Prompt the LLM once, branch on the first generated token among top-k (k=10), then greedily complete each branch (max_new_tokens=256–384). This yields k candidate solution texts.\n2) Answer extraction: For each candidate, extract a final numeric answer using a robust heuristic (prefer \\boxed{}, else last-number-in-text).\n3) Baseline reranking (comparative method): compute Δ_answer (average top1–top2 logit margin over answer tokens) and select argmax.\n4) Proposed reranking (FAct-A²):\n   - Step 0 Triage: compute Δ_answer for all k candidates and only audit the top-m candidates (m=3). Non-audited candidates receive a large penalty.\n   - Step 1 Faithful audit extraction: for each audited candidate, run two extraction prompts (variant A/B) that must output JSON steps [{expr,val,cite},…], where cite is an exact verbatim substring from the candidate.\n   - Step 2 Deterministic Python-side verification: sandbox-evaluate expr via AST whitelisting, check val agreement, and enforce grounding via cite substring + token containment. Compute faithful_pass_rate and final_consistent.\n   - Step 3 Anti-rationalization: compute dual-extraction agreement based on the last verified audited value.\n   - Final score: Score(c)=Δ_answer(c)+α·log(faithful_pass_rate+ε)+β·final_consistent+γ·log(agreement+ε), selecting argmax.\n\nScale/feasibility for the provided Runner (single A100/H200 80GB+ VRAM, very large RAM):\n- No training/fine-tuning; inference-only evaluation.\n- Single 7B model loaded in bf16/fp16 with device_map=\"auto\".\n- Compute kept bounded by triage: only 2m extra generations per question for auditing (m=3 ⇒ 6), instead of auditing all k (2k).\n- Candidates are generated once and cached to disk (e.g., JSONL) and reused across rerankers, eliminating repeated decoding.\n- Evaluation can be run in two stages: (i) small pilot (e.g., first 200 GSM8K test items) for debugging, (ii) full GSM8K test for final reporting. The Runner resources are sufficient for full test with batching (e.g., batch_size=4–16 prompts depending on max_new_tokens).",
+    "runner_config": {
+      "runner_label": [
+        "self-hosted",
+        "gpu-runner"
+      ],
+      "description": "NVIDIA A100 or H200, VRAM: 80 GB or more, RAM: 2048 GB or more"
+    },
+    "evaluation_metrics": [
+      {
+        "name": "accuracy",
+        "description": "Correctness criteria: A prediction is correct if the selected candidate’s extracted final numeric answer equals the gold answer after numeric normalization. Normalize both by: (i) stripping commas/spaces, (ii) mapping fractions like \"3/4\" to float, (iii) parsing integers/floats, then comparing with tolerance tol = 1e-6 * max(1, |gold|). If parsing fails for either side, mark incorrect.\n\nCalculation method: accuracy = (# correct predictions) / (N questions).\n\nTask appropriateness: GSM8K is a single-final-answer arithmetic task; accuracy directly reflects end-to-end utility and is the primary benchmark metric.\n\nRelevant visualizations: bar chart of accuracy by method; bootstrap 95% CI error bars; per-question correctness flip matrix (Δ-only vs FAct-A²) as a 2×2 heatmap."
+      },
+      {
+        "name": "audit_parse_rate",
+        "description": "Correctness criteria: For a candidate, an audit extraction is considered parseable if a valid JSON array of step objects can be recovered from the model output (using a best-effort bracketed-array regex) and json.loads succeeds.\n\nCalculation method: For each question under a given method, report parse success for the selected candidate. audit_parse_rate = (# selected candidates with at least one parseable extraction among the two variants) / N.\n\nTask appropriateness: The proposed method relies on structured extraction; parse failures are a key practical reliability/engineering signal.\n\nRelevant visualizations: histogram of per-question parse outcomes (none / only A / only B / both); stacked bar by method."
+      },
+      {
+        "name": "faithful_pass_rate_mean",
+        "description": "Correctness criteria: For a selected candidate, each extracted step counts as faithful if (a) expr deterministically evaluates to the claimed val within tolerance, and (b) cite is a verbatim substring of the candidate and contains all numeric/operator tokens appearing in expr (token-containment check).\n\nCalculation method: For one extraction, arith_pass_rate = (# arithmetic-correct steps)/(# steps), cite_rate = (# valid-citation steps)/(# steps), faithful_pass_rate = arith_pass_rate * cite_rate. With dual extraction, take fr = max(fr_A, fr_B) for the chosen candidate. Then faithful_pass_rate_mean = (1/N) * Σ fr_i.\n\nTask appropriateness: Measures whether verification is both correct and grounded in the candidate text, directly targeting the hypothesized ‘verification unfaithfulness/rationalization’ gap.\n\nRelevant visualizations: distribution (violin/box plot) of faithful_pass_rate; scatter plot of Δ_answer vs faithful_pass_rate to show decoupling between confidence and step faithfulness."
+      },
+      {
+        "name": "audited_but_unfaithful_rate",
+        "description": "Correctness criteria: A selected candidate is “audited-but-unfaithful” if arith_pass_rate ≥ 0.8 (steps mostly arithmetically correct) but cite_rate ≤ 0.3 (poor grounding), indicating likely post-hoc rationalization or non-anchored audit.\n\nCalculation method: audited_but_unfaithful_rate = (# selected candidates satisfying the above) / N.\n\nTask appropriateness: Explicitly quantifies the failure mode the method is designed to reduce (clean-looking audits not grounded in the original candidate reasoning).\n\nRelevant visualizations: stacked bar of candidate categories: {unparseable, faithful, audited-but-unfaithful, other}; examples table of top 10 audited-but-unfaithful cases (qualitative appendix)."
+      },
+      {
+        "name": "mean_extra_generation_calls_per_question",
+        "description": "Correctness criteria: Count additional model.generate calls beyond the shared candidate generation.\n\nCalculation method: For each method, mean_extra_generation_calls = (total additional generate calls across all questions) / N. For Δ-only reranking this is ~0 beyond candidate generation; for FAct-A² it is ~2m (two extractions per audited candidate) plus any retries.\n\nTask appropriateness: The hypothesis includes compute-aware triage; reporting overhead is necessary to justify deployability.\n\nRelevant visualizations: bar chart of mean extra calls per question; accuracy-vs-overhead Pareto plot (methods as points)."
+      }
+    ],
+    "models_to_use": [
+      "mistralai/Mistral-7B-Instruct-v0.2 (7B)"
+    ],
+    "datasets_to_use": [
+      "gsm8k"
+    ],
+    "proposed_method": {
+      "method_name": "FAct-A²-CoT-Decoding",
+      "description": "Inference-only decode-time reranking for CoT-decoding candidates that replaces answer-confidence selection with a deterministically checkable, citation-grounded arithmetic audit anchored to the candidate’s own text. Adds (i) compute-aware triage (audit only top-m by Δ_answer), and (ii) anti-rationalization robustness via dual extraction agreement, penalizing audits that change depending on extraction prompt phrasing.",
+      "optuna_config": {
+        "enabled": true,
+        "n_trials": 20,
+        "search_spaces": [
+          {
+            "param_name": "m",
+            "distribution_type": "categorical",
+            "choices": [
+              1,
+              2,
+              3,
+              4,
+              5
+            ]
+          },
+          {
+            "param_name": "alpha",
+            "distribution_type": "uniform",
+            "low": 0.2,
+            "high": 3.0
+          },
+          {
+            "param_name": "beta",
+            "distribution_type": "uniform",
+            "low": 0.0,
+            "high": 2.0
+          },
+          {
+            "param_name": "gamma",
+            "distribution_type": "uniform",
+            "low": 0.0,
+            "high": 2.0
+          },
+          {
+            "param_name": "triage_penalty",
+            "distribution_type": "uniform",
+            "low": 1.0,
+            "high": 10.0
+          },
+          {
+            "param_name": "max_new_tokens",
+            "distribution_type": "categorical",
+            "choices": [
+              256,
+              320,
+              384
+            ]
+          }
+        ]
+      }
+    },
+    "comparative_methods": [
+      {
+        "method_name": "CoT-decoding + Δ_answer reranking (baseline)",
+        "description": "Standard CoT-decoding candidate generation (top-k branch on first token + greedy continuation) with reranking purely by Δ_answer, i.e., answer-token confidence margin. This baseline captures the known failure mode of selecting confident-but-wrong solutions and lacks any step-level deterministic verification or faithfulness anchoring.",
+        "optuna_config": {
+          "enabled": false,
+          "n_trials": 20
+        }
+      }
+    ]
   }
 }

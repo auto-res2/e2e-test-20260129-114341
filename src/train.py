@@ -12,7 +12,7 @@ def _rewrite_run_override() -> None:
     new_argv = []
     for arg in sys.argv:
         if arg.startswith("run="):
-            new_argv.append("runs=" + arg.split("=", 1)[1])
+            new_argv.append("runs@run=" + arg.split("=", 1)[1])
         else:
             new_argv.append(arg)
     sys.argv = new_argv
